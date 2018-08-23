@@ -1,9 +1,9 @@
 package azurerm
 
 import (
+	"context"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"regexp"
@@ -11,6 +11,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/storage"
 	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform/helper/validation"
+	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/helpers/tf"
 )
 
 func resourceArmStorageContainer() *schema.Resource {
@@ -19,6 +21,10 @@ func resourceArmStorageContainer() *schema.Resource {
 		Read:   resourceArmStorageContainerRead,
 		Exists: resourceArmStorageContainerExists,
 		Delete: resourceArmStorageContainerDelete,
+		Timeouts: &schema.ResourceTimeout{
+			Create: schema.DefaultTimeout(time.Minute * 30),
+			Delete: schema.DefaultTimeout(time.Minute * 30),
+		},
 
 		Schema: map[string]*schema.Schema{
 			"name": {
@@ -34,11 +40,16 @@ func resourceArmStorageContainer() *schema.Resource {
 				ForceNew: true,
 			},
 			"container_access_type": {
-				Type:         schema.TypeString,
-				Optional:     true,
-				ForceNew:     true,
-				Default:      "private",
-				ValidateFunc: validateArmStorageContainerAccessType,
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: true,
+				Default:  "private",
+				ValidateFunc: validation.StringInSlice(
+					[]string{
+						"blob",
+						"container",
+						"private",
+					}, true),
 			},
 			"properties": {
 				Type:     schema.TypeMap,
@@ -48,39 +59,6 @@ func resourceArmStorageContainer() *schema.Resource {
 	}
 }
 
-//Following the naming convention as laid out in the docs
-func validateArmStorageContainerName(v interface{}, k string) (ws []string, errors []error) {
-	value := v.(string)
-	if !regexp.MustCompile(`^\$root$|^[0-9a-z-]+$`).MatchString(value) {
-		errors = append(errors, fmt.Errorf(
-			"only lowercase alphanumeric characters and hyphens allowed in %q: %q",
-			k, value))
-	}
-	if len(value) < 3 || len(value) > 63 {
-		errors = append(errors, fmt.Errorf(
-			"%q must be between 3 and 63 characters: %q", k, value))
-	}
-	if regexp.MustCompile(`^-`).MatchString(value) {
-		errors = append(errors, fmt.Errorf(
-			"%q cannot begin with a hyphen: %q", k, value))
-	}
-	return
-}
-
-func validateArmStorageContainerAccessType(v interface{}, k string) (ws []string, errors []error) {
-	value := strings.ToLower(v.(string))
-	validTypes := map[string]struct{}{
-		"private":   {},
-		"blob":      {},
-		"container": {},
-	}
-
-	if _, ok := validTypes[value]; !ok {
-		errors = append(errors, fmt.Errorf("Storage container access type %q is invalid, must be %q, %q or %q", value, "private", "blob", "page"))
-	}
-	return
-}
-
 func resourceArmStorageContainerCreate(d *schema.ResourceData, meta interface{}) error {
 	armClient := meta.(*ArmClient)
 	ctx := armClient.StopContext
@@ -88,7 +66,9 @@ func resourceArmStorageContainerCreate(d *schema.ResourceData, meta interface{})
 	resourceGroupName := d.Get("resource_group_name").(string)
 	storageAccountName := d.Get("storage_account_name").(string)
 
-	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
+	waitCtx, cancel := context.WithTimeout(ctx, d.Timeout(schema.TimeoutCreate))
+	defer cancel()
+	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(waitCtx, resourceGroupName, storageAccountName)
 	if err != nil {
 		return err
 	}
@@ -105,9 +85,17 @@ func resourceArmStorageContainerCreate(d *schema.ResourceData, meta interface{})
 		accessType = storage.ContainerAccessType(d.Get("container_access_type").(string))
 	}
 
-	log.Printf("[INFO] Creating container %q in storage account %q.", name, storageAccountName)
 	reference := blobClient.GetContainerReference(name)
+	exists, err := reference.Exists()
+	if err != nil {
+		return fmt.Errorf("Error checking if container %q exists in storage account %q: %+v", name, storageAccountName, err)
+	}
 
+	if exists {
+		return tf.ImportAsExistsError("azurerm_storage_container", name)
+	}
+
+	log.Printf("[INFO] Creating container %q in storage account %q.", name, storageAccountName)
 	err = resource.Retry(120*time.Second, checkContainerIsCreated(reference))
 	if err != nil {
 		return fmt.Errorf("Error creating container %q in storage account %q: %s", name, storageAccountName, err)
@@ -122,24 +110,11 @@ func resourceArmStorageContainerCreate(d *schema.ResourceData, meta interface{})
 		return fmt.Errorf("Error setting permissions for container %s in storage account %s: %+v", name, storageAccountName, err)
 	}
 
+	// TODO: fix the ID to be https://storageaccount.blob.core..../name and parse it
 	d.SetId(name)
 	return resourceArmStorageContainerRead(d, meta)
 }
 
-func checkContainerIsCreated(reference *storage.Container) func() *resource.RetryError {
-	return func() *resource.RetryError {
-		createOptions := &storage.CreateContainerOptions{}
-		_, err := reference.CreateIfNotExists(createOptions)
-		if err != nil {
-			return resource.RetryableError(err)
-		}
-
-		return nil
-	}
-}
-
-// resourceAzureStorageContainerRead does all the necessary API calls to
-// read the status of the storage container off Azure.
 func resourceArmStorageContainerRead(d *schema.ResourceData, meta interface{}) error {
 	armClient := meta.(*ArmClient)
 	ctx := armClient.StopContext
@@ -223,8 +198,6 @@ func resourceArmStorageContainerExists(d *schema.ResourceData, meta interface{})
 	return exists, nil
 }
 
-// resourceAzureStorageContainerDelete does all the necessary API calls to
-// delete a storage container off Azure.
 func resourceArmStorageContainerDelete(d *schema.ResourceData, meta interface{}) error {
 	armClient := meta.(*ArmClient)
 	ctx := armClient.StopContext
@@ -232,12 +205,14 @@ func resourceArmStorageContainerDelete(d *schema.ResourceData, meta interface{})
 	resourceGroupName := d.Get("resource_group_name").(string)
 	storageAccountName := d.Get("storage_account_name").(string)
 
-	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
+	waitCtx, cancel := context.WithTimeout(ctx, d.Timeout(schema.TimeoutDelete))
+	defer cancel()
+	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(waitCtx, resourceGroupName, storageAccountName)
 	if err != nil {
 		return err
 	}
 	if !accountExists {
-		log.Printf("[INFO]Storage Account %q doesn't exist so the container won't exist", storageAccountName)
+		log.Printf("[INFO] Storage Account %q doesn't exist so the container won't exist", storageAccountName)
 		return nil
 	}
 
@@ -250,6 +225,36 @@ func resourceArmStorageContainerDelete(d *schema.ResourceData, meta interface{})
 		return fmt.Errorf("Error deleting storage container %q from storage account %q: %s", name, storageAccountName, err)
 	}
 
-	d.SetId("")
 	return nil
+}
+
+func checkContainerIsCreated(reference *storage.Container) func() *resource.RetryError {
+	return func() *resource.RetryError {
+		createOptions := &storage.CreateContainerOptions{}
+		_, err := reference.CreateIfNotExists(createOptions)
+		if err != nil {
+			return resource.RetryableError(err)
+		}
+
+		return nil
+	}
+}
+
+//Following the naming convention as laid out in the docs
+func validateArmStorageContainerName(v interface{}, k string) (ws []string, errors []error) {
+	value := v.(string)
+	if !regexp.MustCompile(`^\$root$|^[0-9a-z-]+$`).MatchString(value) {
+		errors = append(errors, fmt.Errorf(
+			"only lowercase alphanumeric characters and hyphens allowed in %q: %q",
+			k, value))
+	}
+	if len(value) < 3 || len(value) > 63 {
+		errors = append(errors, fmt.Errorf(
+			"%q must be between 3 and 63 characters: %q", k, value))
+	}
+	if regexp.MustCompile(`^-`).MatchString(value) {
+		errors = append(errors, fmt.Errorf(
+			"%q cannot begin with a hyphen: %q", k, value))
+	}
+	return
 }
