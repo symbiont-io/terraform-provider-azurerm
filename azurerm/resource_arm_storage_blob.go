@@ -27,6 +27,7 @@ func resourceArmStorageBlob() *schema.Resource {
 		Update: resourceArmStorageBlobUpdate,
 		Exists: resourceArmStorageBlobExists,
 		Delete: resourceArmStorageBlobDelete,
+		// TODO: support Import
 		Timeouts: &schema.ResourceTimeout{
 			Create: schema.DefaultTimeout(time.Minute * 30),
 			Update: schema.DefaultTimeout(time.Minute * 30),

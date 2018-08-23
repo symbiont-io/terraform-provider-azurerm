@@ -21,6 +21,7 @@ func resourceArmStorageContainer() *schema.Resource {
 		Read:   resourceArmStorageContainerRead,
 		Exists: resourceArmStorageContainerExists,
 		Delete: resourceArmStorageContainerDelete,
+		// TODO: support Import
 		Timeouts: &schema.ResourceTimeout{
 			Create: schema.DefaultTimeout(time.Minute * 30),
 			Delete: schema.DefaultTimeout(time.Minute * 30),
