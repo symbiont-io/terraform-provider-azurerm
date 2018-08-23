@@ -2,6 +2,7 @@ package azurerm
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
@@ -11,9 +12,12 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/storage"
 	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform/helper/validation"
+	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/helpers/tf"
 )
 
 func resourceArmStorageBlob() *schema.Resource {
@@ -23,6 +27,11 @@ func resourceArmStorageBlob() *schema.Resource {
 		Update: resourceArmStorageBlobUpdate,
 		Exists: resourceArmStorageBlobExists,
 		Delete: resourceArmStorageBlobDelete,
+		Timeouts: &schema.ResourceTimeout{
+			Create: schema.DefaultTimeout(time.Minute * 30),
+			Update: schema.DefaultTimeout(time.Minute * 30),
+			Delete: schema.DefaultTimeout(time.Minute * 30),
+		},
 
 		Schema: map[string]*schema.Schema{
 			"name": {
@@ -42,10 +51,13 @@ func resourceArmStorageBlob() *schema.Resource {
 				ForceNew: true,
 			},
 			"type": {
-				Type:         schema.TypeString,
-				Optional:     true,
-				ForceNew:     true,
-				ValidateFunc: validateArmStorageBlobType,
+				Type:     schema.TypeString,
+				Optional: true,
+				ForceNew: true,
+				ValidateFunc: validation.StringInSlice([]string{
+					"block",
+					"page",
+				}, false),
 			},
 			"size": {
 				Type:         schema.TypeInt,
@@ -94,50 +106,136 @@ func resourceArmStorageBlob() *schema.Resource {
 	}
 }
 
-func validateArmStorageBlobParallelism(v interface{}, k string) (ws []string, errors []error) {
-	value := v.(int)
-
-	if value <= 0 {
-		errors = append(errors, fmt.Errorf("Blob Parallelism %q is invalid, must be greater than 0", value))
-	}
-
-	return
-}
-
-func validateArmStorageBlobAttempts(v interface{}, k string) (ws []string, errors []error) {
-	value := v.(int)
-
-	if value <= 0 {
-		errors = append(errors, fmt.Errorf("Blob Attempts %q is invalid, must be greater than 0", value))
-	}
-
-	return
-}
-
-func validateArmStorageBlobSize(v interface{}, k string) (ws []string, errors []error) {
-	value := v.(int)
-
-	if value%512 != 0 {
-		errors = append(errors, fmt.Errorf("Blob Size %q is invalid, must be a multiple of 512", value))
-	}
-
-	return
-}
-
-func validateArmStorageBlobType(v interface{}, k string) (ws []string, errors []error) {
-	value := strings.ToLower(v.(string))
-	validTypes := map[string]struct{}{
-		"block": struct{}{},
-		"page":  struct{}{},
-	}
-
-	if _, ok := validTypes[value]; !ok {
-		errors = append(errors, fmt.Errorf("Blob type %q is invalid, must be %q or %q", value, "block", "page"))
-	}
-	return
-}
-
 func resourceArmStorageBlobCreate(d *schema.ResourceData, meta interface{}) error {
+	armClient := meta.(*ArmClient)
+	ctx := armClient.StopContext
+
+	resourceGroupName := d.Get("resource_group_name").(string)
+	storageAccountName := d.Get("storage_account_name").(string)
+
+	waitCtx, cancel := context.WithTimeout(ctx, d.Timeout(schema.TimeoutCreate))
+	defer cancel()
+	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(waitCtx, resourceGroupName, storageAccountName)
+	if err != nil {
+		return err
+	}
+	if !accountExists {
+		return fmt.Errorf("Storage Account %q Not Found", storageAccountName)
+	}
+
+	name := d.Get("name").(string)
+	containerName := d.Get("storage_container_name").(string)
+
+	container := blobClient.GetContainerReference(containerName)
+	exists, err := container.Exists()
+	if err != nil {
+		return fmt.Errorf("Error checking if container %q exists in storage account %q: %+v", containerName, storageAccountName, err)
+	}
+
+	if !exists {
+		return fmt.Errorf("Container %q doesn't exist within Storage Account %q", containerName, storageAccountName)
+	}
+
+	blob := container.GetBlobReference(name)
+	exists, err = blob.Exists()
+	if err != nil {
+		return fmt.Errorf("Error checking if blob %q exists in container %q: %+v", name, containerName, err)
+	}
+	if exists {
+		return tf.ImportAsExistsError("azurerm_storage_blob", name)
+	}
+
+	blobType := d.Get("type").(string)
+	sourceUri := d.Get("source_uri").(string)
+	contentType := d.Get("content_type").(string)
+
+	log.Printf("[INFO] Creating blob %q in storage account %q", name, storageAccountName)
+	if sourceUri != "" {
+		options := &storage.CopyOptions{}
+		err := blob.Copy(sourceUri, options)
+		if err != nil {
+			return fmt.Errorf("Error creating storage blob on Azure: %s", err)
+		}
+	} else {
+		switch strings.ToLower(blobType) {
+		case "block":
+			options := &storage.PutBlobOptions{}
+			err := blob.CreateBlockBlob(options)
+			if err != nil {
+				return fmt.Errorf("Error creating storage blob on Azure: %s", err)
+			}
+
+			source := d.Get("source").(string)
+			if source != "" {
+				parallelism := d.Get("parallelism").(int)
+				attempts := d.Get("attempts").(int)
+				if err := resourceArmStorageBlobBlockUploadFromSource(containerName, name, source, contentType, blobClient, parallelism, attempts); err != nil {
+					return fmt.Errorf("Error creating storage blob on Azure: %s", err)
+				}
+			}
+		case "page":
+			source := d.Get("source").(string)
+			if source != "" {
+				parallelism := d.Get("parallelism").(int)
+				attempts := d.Get("attempts").(int)
+				if err := resourceArmStorageBlobPageUploadFromSource(containerName, name, source, contentType, blobClient, parallelism, attempts); err != nil {
+					return fmt.Errorf("Error creating storage blob on Azure: %s", err)
+				}
+			} else {
+				size := int64(d.Get("size").(int))
+				options := &storage.PutBlobOptions{}
+				blob.Properties.ContentLength = size
+				blob.Properties.ContentType = contentType
+				err := blob.PutPageBlob(options)
+				if err != nil {
+					return fmt.Errorf("Error creating storage blob on Azure: %s", err)
+				}
+			}
+		}
+	}
+
+	// TODO: fix the id
+	d.SetId(name)
+	return resourceArmStorageBlobRead(d, meta)
+}
+
+func resourceArmStorageBlobUpdate(d *schema.ResourceData, meta interface{}) error {
+	armClient := meta.(*ArmClient)
+	ctx := armClient.StopContext
+
+	resourceGroupName := d.Get("resource_group_name").(string)
+	storageAccountName := d.Get("storage_account_name").(string)
+
+	waitCtx, cancel := context.WithTimeout(ctx, d.Timeout(schema.TimeoutUpdate))
+	defer cancel()
+	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(waitCtx, resourceGroupName, storageAccountName)
+	if err != nil {
+		return fmt.Errorf("Error getting storage account %s: %+v", storageAccountName, err)
+	}
+	if !accountExists {
+		return fmt.Errorf("Storage account %s not found in resource group %s", storageAccountName, resourceGroupName)
+	}
+
+	name := d.Get("name").(string)
+	storageContainerName := d.Get("storage_container_name").(string)
+
+	container := blobClient.GetContainerReference(storageContainerName)
+	blob := container.GetBlobReference(name)
+
+	if d.HasChange("content_type") {
+		blob.Properties.ContentType = d.Get("content_type").(string)
+	}
+
+	options := &storage.SetBlobPropertiesOptions{}
+	err = blob.SetProperties(options)
+	if err != nil {
+		return fmt.Errorf("Error setting properties of blob %s (container %s, storage account %s): %+v", name, storageContainerName, storageAccountName, err)
+	}
+
+	return nil
+}
+
+func resourceArmStorageBlobRead(d *schema.ResourceData, meta interface{}) error {
 	armClient := meta.(*ArmClient)
 	ctx := armClient.StopContext
 
@@ -149,69 +247,111 @@ func resourceArmStorageBlobCreate(d *schema.ResourceData, meta interface{}) erro
 		return err
 	}
 	if !accountExists {
-		return fmt.Errorf("Storage Account %q Not Found", storageAccountName)
+		log.Printf("[DEBUG] Storage account %q not found, removing blob %q from state", storageAccountName, d.Id())
+		d.SetId("")
+		return nil
+	}
+
+	exists, err := resourceArmStorageBlobExists(d, meta)
+	if err != nil {
+		return err
+	}
+
+	if !exists {
+		// Exists already removed this from state
+		return nil
 	}
 
 	name := d.Get("name").(string)
-	blobType := d.Get("type").(string)
-	cont := d.Get("storage_container_name").(string)
-	sourceUri := d.Get("source_uri").(string)
-	contentType := d.Get("content_type").(string)
+	storageContainerName := d.Get("storage_container_name").(string)
 
-	log.Printf("[INFO] Creating blob %q in storage account %q", name, storageAccountName)
-	if sourceUri != "" {
-		options := &storage.CopyOptions{}
-		container := blobClient.GetContainerReference(cont)
-		blob := container.GetBlobReference(name)
-		err := blob.Copy(sourceUri, options)
-		if err != nil {
-			return fmt.Errorf("Error creating storage blob on Azure: %s", err)
-		}
-	} else {
-		switch strings.ToLower(blobType) {
-		case "block":
-			options := &storage.PutBlobOptions{}
-			container := blobClient.GetContainerReference(cont)
-			blob := container.GetBlobReference(name)
-			err := blob.CreateBlockBlob(options)
-			if err != nil {
-				return fmt.Errorf("Error creating storage blob on Azure: %s", err)
-			}
+	container := blobClient.GetContainerReference(storageContainerName)
+	blob := container.GetBlobReference(name)
 
-			source := d.Get("source").(string)
-			if source != "" {
-				parallelism := d.Get("parallelism").(int)
-				attempts := d.Get("attempts").(int)
-				if err := resourceArmStorageBlobBlockUploadFromSource(cont, name, source, contentType, blobClient, parallelism, attempts); err != nil {
-					return fmt.Errorf("Error creating storage blob on Azure: %s", err)
-				}
-			}
-		case "page":
-			source := d.Get("source").(string)
-			if source != "" {
-				parallelism := d.Get("parallelism").(int)
-				attempts := d.Get("attempts").(int)
-				if err := resourceArmStorageBlobPageUploadFromSource(cont, name, source, contentType, blobClient, parallelism, attempts); err != nil {
-					return fmt.Errorf("Error creating storage blob on Azure: %s", err)
-				}
-			} else {
-				size := int64(d.Get("size").(int))
-				options := &storage.PutBlobOptions{}
+	options := &storage.GetBlobPropertiesOptions{}
+	err = blob.GetProperties(options)
+	if err != nil {
+		return fmt.Errorf("Error getting properties of blob %s (container %s, storage account %s): %+v", name, storageContainerName, storageAccountName, err)
+	}
+	d.Set("content_type", blob.Properties.ContentType)
 
-				container := blobClient.GetContainerReference(cont)
-				blob := container.GetBlobReference(name)
-				blob.Properties.ContentLength = size
-				blob.Properties.ContentType = contentType
-				err := blob.PutPageBlob(options)
-				if err != nil {
-					return fmt.Errorf("Error creating storage blob on Azure: %s", err)
-				}
-			}
-		}
+	url := blob.GetURL()
+	if url == "" {
+		log.Printf("[INFO] URL for %q is empty", name)
+	}
+	d.Set("url", url)
+
+	return nil
+}
+
+func resourceArmStorageBlobExists(d *schema.ResourceData, meta interface{}) (bool, error) {
+	armClient := meta.(*ArmClient)
+	ctx := armClient.StopContext
+
+	resourceGroupName := d.Get("resource_group_name").(string)
+	storageAccountName := d.Get("storage_account_name").(string)
+
+	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
+	if err != nil {
+		return false, err
+	}
+	if !accountExists {
+		log.Printf("[DEBUG] Storage account %q not found, removing blob %q from state", storageAccountName, d.Id())
+		d.SetId("")
+		return false, nil
 	}
 
-	d.SetId(name)
-	return resourceArmStorageBlobRead(d, meta)
+	name := d.Get("name").(string)
+	storageContainerName := d.Get("storage_container_name").(string)
+
+	log.Printf("[INFO] Checking for existence of storage blob %q.", name)
+	container := blobClient.GetContainerReference(storageContainerName)
+	blob := container.GetBlobReference(name)
+	exists, err := blob.Exists()
+	if err != nil {
+		return false, fmt.Errorf("error testing existence of storage blob %q: %s", name, err)
+	}
+
+	if !exists {
+		log.Printf("[INFO] Storage blob %q no longer exists, removing from state...", name)
+		d.SetId("")
+	}
+
+	return exists, nil
+}
+
+func resourceArmStorageBlobDelete(d *schema.ResourceData, meta interface{}) error {
+	armClient := meta.(*ArmClient)
+	ctx := armClient.StopContext
+
+	resourceGroupName := d.Get("resource_group_name").(string)
+	storageAccountName := d.Get("storage_account_name").(string)
+
+	waitCtx, cancel := context.WithTimeout(ctx, d.Timeout(schema.TimeoutDelete))
+	defer cancel()
+	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(waitCtx, resourceGroupName, storageAccountName)
+	if err != nil {
+		return err
+	}
+	if !accountExists {
+		log.Printf("[INFO] Storage Account %q doesn't exist so the blob won't exist", storageAccountName)
+		return nil
+	}
+
+	name := d.Get("name").(string)
+	storageContainerName := d.Get("storage_container_name").(string)
+
+	log.Printf("[INFO] Deleting storage blob %q", name)
+	options := &storage.DeleteBlobOptions{}
+	container := blobClient.GetContainerReference(storageContainerName)
+	blob := container.GetBlobReference(name)
+	_, err = blob.DeleteIfExists(options)
+	if err != nil {
+		return fmt.Errorf("Error deleting storage blob %q: %s", name, err)
+	}
+
+	d.SetId("")
+	return nil
 }
 
 type resourceArmStorageBlobPage struct {
@@ -234,6 +374,7 @@ func resourceArmStorageBlobPageUploadFromSource(container, name, source, content
 	}
 
 	options := &storage.PutBlobOptions{}
+	// we don't bother re-checking if they exist here, since this is done in the Create
 	containerRef := client.GetContainerReference(container)
 	blob := containerRef.GetBlobReference(name)
 	blob.Properties.ContentLength = blobSize
@@ -535,153 +676,32 @@ func resourceArmStorageBlobBlockUploadWorker(ctx resourceArmStorageBlobBlockUplo
 	}
 }
 
-func resourceArmStorageBlobUpdate(d *schema.ResourceData, meta interface{}) error {
-	armClient := meta.(*ArmClient)
-	ctx := armClient.StopContext
+func validateArmStorageBlobParallelism(v interface{}, k string) (ws []string, errors []error) {
+	value := v.(int)
 
-	resourceGroupName := d.Get("resource_group_name").(string)
-	storageAccountName := d.Get("storage_account_name").(string)
-
-	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
-	if err != nil {
-		return fmt.Errorf("Error getting storage account %s: %+v", storageAccountName, err)
-	}
-	if !accountExists {
-		return fmt.Errorf("Storage account %s not found in resource group %s", storageAccountName, resourceGroupName)
+	if value <= 0 {
+		errors = append(errors, fmt.Errorf("Blob Parallelism %q is invalid, must be greater than 0", value))
 	}
 
-	name := d.Get("name").(string)
-	storageContainerName := d.Get("storage_container_name").(string)
-
-	container := blobClient.GetContainerReference(storageContainerName)
-	blob := container.GetBlobReference(name)
-
-	if d.HasChange("content_type") {
-		blob.Properties.ContentType = d.Get("content_type").(string)
-	}
-
-	options := &storage.SetBlobPropertiesOptions{}
-	err = blob.SetProperties(options)
-	if err != nil {
-		return fmt.Errorf("Error setting properties of blob %s (container %s, storage account %s): %+v", name, storageContainerName, storageAccountName, err)
-	}
-
-	return nil
+	return
 }
 
-func resourceArmStorageBlobRead(d *schema.ResourceData, meta interface{}) error {
-	armClient := meta.(*ArmClient)
-	ctx := armClient.StopContext
+func validateArmStorageBlobAttempts(v interface{}, k string) (ws []string, errors []error) {
+	value := v.(int)
 
-	resourceGroupName := d.Get("resource_group_name").(string)
-	storageAccountName := d.Get("storage_account_name").(string)
-
-	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
-	if err != nil {
-		return err
-	}
-	if !accountExists {
-		log.Printf("[DEBUG] Storage account %q not found, removing blob %q from state", storageAccountName, d.Id())
-		d.SetId("")
-		return nil
+	if value <= 0 {
+		errors = append(errors, fmt.Errorf("Blob Attempts %q is invalid, must be greater than 0", value))
 	}
 
-	exists, err := resourceArmStorageBlobExists(d, meta)
-	if err != nil {
-		return err
-	}
-
-	if !exists {
-		// Exists already removed this from state
-		return nil
-	}
-
-	name := d.Get("name").(string)
-	storageContainerName := d.Get("storage_container_name").(string)
-
-	container := blobClient.GetContainerReference(storageContainerName)
-	blob := container.GetBlobReference(name)
-
-	options := &storage.GetBlobPropertiesOptions{}
-	err = blob.GetProperties(options)
-	if err != nil {
-		return fmt.Errorf("Error getting properties of blob %s (container %s, storage account %s): %+v", name, storageContainerName, storageAccountName, err)
-	}
-	d.Set("content_type", blob.Properties.ContentType)
-
-	url := blob.GetURL()
-	if url == "" {
-		log.Printf("[INFO] URL for %q is empty", name)
-	}
-	d.Set("url", url)
-
-	return nil
+	return
 }
 
-func resourceArmStorageBlobExists(d *schema.ResourceData, meta interface{}) (bool, error) {
-	armClient := meta.(*ArmClient)
-	ctx := armClient.StopContext
+func validateArmStorageBlobSize(v interface{}, k string) (ws []string, errors []error) {
+	value := v.(int)
 
-	resourceGroupName := d.Get("resource_group_name").(string)
-	storageAccountName := d.Get("storage_account_name").(string)
-
-	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
-	if err != nil {
-		return false, err
-	}
-	if !accountExists {
-		log.Printf("[DEBUG] Storage account %q not found, removing blob %q from state", storageAccountName, d.Id())
-		d.SetId("")
-		return false, nil
+	if value%512 != 0 {
+		errors = append(errors, fmt.Errorf("Blob Size %q is invalid, must be a multiple of 512", value))
 	}
 
-	name := d.Get("name").(string)
-	storageContainerName := d.Get("storage_container_name").(string)
-
-	log.Printf("[INFO] Checking for existence of storage blob %q.", name)
-	container := blobClient.GetContainerReference(storageContainerName)
-	blob := container.GetBlobReference(name)
-	exists, err := blob.Exists()
-	if err != nil {
-		return false, fmt.Errorf("error testing existence of storage blob %q: %s", name, err)
-	}
-
-	if !exists {
-		log.Printf("[INFO] Storage blob %q no longer exists, removing from state...", name)
-		d.SetId("")
-	}
-
-	return exists, nil
-}
-
-func resourceArmStorageBlobDelete(d *schema.ResourceData, meta interface{}) error {
-	armClient := meta.(*ArmClient)
-	ctx := armClient.StopContext
-
-	resourceGroupName := d.Get("resource_group_name").(string)
-	storageAccountName := d.Get("storage_account_name").(string)
-
-	blobClient, accountExists, err := armClient.getBlobStorageClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
-	if err != nil {
-		return err
-	}
-	if !accountExists {
-		log.Printf("[INFO]Storage Account %q doesn't exist so the blob won't exist", storageAccountName)
-		return nil
-	}
-
-	name := d.Get("name").(string)
-	storageContainerName := d.Get("storage_container_name").(string)
-
-	log.Printf("[INFO] Deleting storage blob %q", name)
-	options := &storage.DeleteBlobOptions{}
-	container := blobClient.GetContainerReference(storageContainerName)
-	blob := container.GetBlobReference(name)
-	_, err = blob.DeleteIfExists(options)
-	if err != nil {
-		return fmt.Errorf("Error deleting storage blob %q: %s", name, err)
-	}
-
-	d.SetId("")
-	return nil
+	return
 }
