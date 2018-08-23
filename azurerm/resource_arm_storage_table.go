@@ -7,6 +7,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/storage"
 	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/terraform-providers/terraform-provider-azurerm/azurerm/helpers/tf"
 )
 
 func resourceArmStorageTable() *schema.Resource {
@@ -14,6 +15,7 @@ func resourceArmStorageTable() *schema.Resource {
 		Create: resourceArmStorageTableCreate,
 		Read:   resourceArmStorageTableRead,
 		Delete: resourceArmStorageTableDelete,
+		// TODO: import support
 
 		Schema: map[string]*schema.Schema{
 			"name": {
@@ -32,6 +34,119 @@ func resourceArmStorageTable() *schema.Resource {
 	}
 }
 
+func resourceArmStorageTableCreate(d *schema.ResourceData, meta interface{}) error {
+	armClient := meta.(*ArmClient)
+	ctx := armClient.StopContext
+
+	name := d.Get("name").(string)
+	resourceGroupName := d.Get("resource_group_name").(string)
+	storageAccountName := d.Get("storage_account_name").(string)
+
+	tableClient, accountExists, err := armClient.getTableServiceClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
+	if err != nil {
+		return err
+	}
+	if !accountExists {
+		return fmt.Errorf("Storage Account %q Not Found", storageAccountName)
+	}
+
+	// firstly check if the table already exists and needs importing
+	tables, err := tableClient.QueryTables(storage.MinimalMetadata, &storage.QueryTablesOptions{})
+	if err != nil {
+		return fmt.Errorf("Failed to retrieve storage tables in account %q: %s", name, err)
+	}
+
+	for _, t := range tables.Tables {
+		if t.Name == name {
+			return tf.ImportAsExistsError("azurerm_storage_table", t.Name)
+		}
+	}
+
+	log.Printf("[INFO] Creating table %q in storage account %q.", name, storageAccountName)
+	table := tableClient.GetTableReference(name)
+	timeout := uint(60)
+	options := &storage.TableOptions{}
+	err = table.Create(timeout, storage.NoMetadata, options)
+	if err != nil {
+		return fmt.Errorf("Error creating table %q in storage account %q: %s", name, storageAccountName, err)
+	}
+
+	// TODO: fix the ID
+	d.SetId(name)
+
+	return resourceArmStorageTableRead(d, meta)
+}
+
+func resourceArmStorageTableRead(d *schema.ResourceData, meta interface{}) error {
+	armClient := meta.(*ArmClient)
+	ctx := armClient.StopContext
+
+	name := d.Get("name").(string)
+	resourceGroupName := d.Get("resource_group_name").(string)
+	storageAccountName := d.Get("storage_account_name").(string)
+
+	tableClient, accountExists, err := armClient.getTableServiceClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
+	if err != nil {
+		return err
+	}
+	if !accountExists {
+		log.Printf("[DEBUG] Storage account %q not found, removing table %q from state", storageAccountName, d.Id())
+		d.SetId("")
+		return nil
+	}
+
+	options := &storage.QueryTablesOptions{}
+	tables, err := tableClient.QueryTables(storage.MinimalMetadata, options)
+	if err != nil {
+		return fmt.Errorf("Failed to retrieve storage tables in account %q: %s", name, err)
+	}
+
+	var table *storage.Table
+	for _, t := range tables.Tables {
+		if t.Name == name {
+			table = &t
+		}
+	}
+
+	if table == nil {
+		log.Printf("[INFO] Storage table %q does not exist in account %q, removing from state...", name, storageAccountName)
+		d.SetId("")
+		return nil
+	}
+
+	d.Set("name", table.Name)
+	return nil
+}
+
+func resourceArmStorageTableDelete(d *schema.ResourceData, meta interface{}) error {
+	armClient := meta.(*ArmClient)
+	ctx := armClient.StopContext
+
+	name := d.Get("name").(string)
+	resourceGroupName := d.Get("resource_group_name").(string)
+	storageAccountName := d.Get("storage_account_name").(string)
+
+	tableClient, accountExists, err := armClient.getTableServiceClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
+	if err != nil {
+		return err
+	}
+	if !accountExists {
+		log.Printf("[INFO] Storage Account %q doesn't exist so the table won't exist", storageAccountName)
+		return nil
+	}
+
+	table := tableClient.GetTableReference(name)
+	timeout := uint(60)
+	options := &storage.TableOptions{}
+
+	log.Printf("[INFO] Deleting storage table %q in account %q", name, storageAccountName)
+	if err := table.Delete(timeout, options); err != nil {
+		return fmt.Errorf("Error deleting storage table %q from storage account %q: %s", name, storageAccountName, err)
+	}
+
+	return nil
+}
+
 func validateArmStorageTableName(v interface{}, k string) (ws []string, errors []error) {
 	value := v.(string)
 	if value == "table" {
@@ -46,108 +161,4 @@ func validateArmStorageTableName(v interface{}, k string) (ws []string, errors [
 	}
 
 	return
-}
-
-func resourceArmStorageTableCreate(d *schema.ResourceData, meta interface{}) error {
-	armClient := meta.(*ArmClient)
-	ctx := armClient.StopContext
-
-	resourceGroupName := d.Get("resource_group_name").(string)
-	storageAccountName := d.Get("storage_account_name").(string)
-
-	tableClient, accountExists, err := armClient.getTableServiceClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
-	if err != nil {
-		return err
-	}
-	if !accountExists {
-		return fmt.Errorf("Storage Account %q Not Found", storageAccountName)
-	}
-
-	name := d.Get("name").(string)
-	table := tableClient.GetTableReference(name)
-
-	log.Printf("[INFO] Creating table %q in storage account %q.", name, storageAccountName)
-
-	timeout := uint(60)
-	options := &storage.TableOptions{}
-	err = table.Create(timeout, storage.NoMetadata, options)
-	if err != nil {
-		return fmt.Errorf("Error creating table %q in storage account %q: %s", name, storageAccountName, err)
-	}
-
-	d.SetId(name)
-
-	return resourceArmStorageTableRead(d, meta)
-}
-
-func resourceArmStorageTableRead(d *schema.ResourceData, meta interface{}) error {
-	armClient := meta.(*ArmClient)
-	ctx := armClient.StopContext
-
-	resourceGroupName := d.Get("resource_group_name").(string)
-	storageAccountName := d.Get("storage_account_name").(string)
-
-	tableClient, accountExists, err := armClient.getTableServiceClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
-	if err != nil {
-		return err
-	}
-	if !accountExists {
-		log.Printf("[DEBUG] Storage account %q not found, removing table %q from state", storageAccountName, d.Id())
-		d.SetId("")
-		return nil
-	}
-
-	name := d.Get("name").(string)
-	metaDataLevel := storage.MinimalMetadata
-	options := &storage.QueryTablesOptions{}
-	tables, err := tableClient.QueryTables(metaDataLevel, options)
-	if err != nil {
-		return fmt.Errorf("Failed to retrieve storage tables in account %q: %s", name, err)
-	}
-
-	var found bool
-	for _, table := range tables.Tables {
-		tableName := string(table.Name)
-		if tableName == name {
-			found = true
-			d.Set("name", tableName)
-		}
-	}
-
-	if !found {
-		log.Printf("[INFO] Storage table %q does not exist in account %q, removing from state...", name, storageAccountName)
-		d.SetId("")
-	}
-
-	return nil
-}
-
-func resourceArmStorageTableDelete(d *schema.ResourceData, meta interface{}) error {
-	armClient := meta.(*ArmClient)
-	ctx := armClient.StopContext
-
-	resourceGroupName := d.Get("resource_group_name").(string)
-	storageAccountName := d.Get("storage_account_name").(string)
-
-	tableClient, accountExists, err := armClient.getTableServiceClientForStorageAccount(ctx, resourceGroupName, storageAccountName)
-	if err != nil {
-		return err
-	}
-	if !accountExists {
-		log.Printf("[INFO] Storage Account %q doesn't exist so the table won't exist", storageAccountName)
-		return nil
-	}
-
-	name := d.Get("name").(string)
-	table := tableClient.GetTableReference(name)
-	timeout := uint(60)
-	options := &storage.TableOptions{}
-
-	log.Printf("[INFO] Deleting storage table %q in account %q", name, storageAccountName)
-	if err := table.Delete(timeout, options); err != nil {
-		return fmt.Errorf("Error deleting storage table %q from storage account %q: %s", name, storageAccountName, err)
-	}
-
-	d.SetId("")
-	return nil
 }
